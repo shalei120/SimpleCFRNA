@@ -20,15 +20,14 @@ from sklearn.pipeline import make_pipeline
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 
-from Focal_loss import FocalLoss
-from torchensemble import FusionClassifier, VotingClassifier, BaggingClassifier, GradientBoostingClassifier, \
-    AdversarialTrainingClassifier, FastGeometricClassifier, SnapshotEnsembleClassifier, SoftGradientBoostingClassifier
+# from torchensemble import FusionClassifier, VotingClassifier, BaggingClassifier, GradientBoostingClassifier, \
+#     AdversarialTrainingClassifier, FastGeometricClassifier, SnapshotEnsembleClassifier, SoftGradientBoostingClassifier
 from copy import deepcopy
 import datetime
 # from linformer import Linformer
 from sklearn.metrics import confusion_matrix
-
-from Hyperparameters import args
+from sklearn.model_selection import GridSearchCV
+from bsh_Hyperparameters2 import args
 
 from typing import Any, List, Optional, Tuple
 
@@ -227,20 +226,50 @@ def train(X_train, y_train, X_valid, y_valid, nclass, feature_names, human_disea
     test_data_tuple = [(test_x, test_y) for
                        test_x, test_y in zip(X_valid_gene, y_valid)]
     print(train_data_tuple[0][0].size(), len(test_data_tuple))
-    train_loader = torch.utils.data.DataLoader(train_data_tuple, batch_size=32, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_data_tuple, batch_size=32, shuffle=True)
+    # train_loader = torch.utils.data.DataLoader(train_data_tuple, batch_size=32, shuffle=True)
+    # test_loader = torch.utils.data.DataLoader(test_data_tuple, batch_size=32, shuffle=True)
 
     regr = make_pipeline(
         # StandardScaler(),
         # SGDClassifier(loss='log_loss', penalty='elasticnet', alpha=0.0001, l1_ratio=0.15, random_state=42)
-        # LogisticRegression(verbose=1)
-        GradientBoostingClassifier(n_estimators=100, learning_rate=1.0,     max_depth=1, random_state=0)
+        # LogisticRegression(penalty='l2',C=0.001,
+        #                    class_weight='balanced', random_state=42,verbose=0)
+        # GradientBoostingClassifier(n_estimators=10, learning_rate=0.05,     max_depth=10, random_state=42,
+        #                            verbose=1,subsample=1.0,max_features=None)
+        # GradientBoostingClassifier(random_state=0)
         # SGDClassifier(loss='log_loss',  alpha=0.0001, l1_ratio=0.15, random_state=42)
     # PCA(n_components=60),
-    #     RandomForestClassifier(n_estimators=100)
+        RandomForestClassifier(class_weight='balanced',random_state=42)
     )
-    regr.fit(X_train_gene, y_train)
+    # regr.fit(X_train_gene, y_train)
 
+    param_grid = {
+        'randomforestclassifier__n_estimators': [100, 200, 300],
+        'randomforestclassifier__max_depth': [5, 10, None],
+        'randomforestclassifier__min_samples_split': [2, 5, 10],
+        'randomforestclassifier__min_samples_leaf': [1, 2, 4]
+    }
+    # param_grid = {
+    # 'gradientboostingclassifier__n_estimators': [50, 100, 200],  # 树的数量
+    # 'gradientboostingclassifier__learning_rate': [0.01, 0.05, 0.1, 0.2],  # 学习率
+    # 'gradientboostingclassifier__max_depth': [3, 5, 10],  # 树的最大深度
+    # 'gradientboostingclassifier__subsample': [0.7, 1.0],  # 样本采样比例
+    # 'gradientboostingclassifier__max_features': ['auto', 'sqrt', 'log2', None]  # 特征选择方式
+    # }
+
+    # 创建 GridSearchCV 对象
+    regr = GridSearchCV(regr, param_grid, cv=5, scoring='roc_auc', n_jobs=-1, verbose=2)
+
+    # 在训练数据上进行网格搜索
+    regr.fit(X_train_gene, y_train)
+    
+    # 输出最佳参数组合
+    print("Best parameters:", regr.best_params_)
+    print("Best cross-validation score:", regr.best_score_)
+    regr = regr.best_estimator_
+
+    # for i, tree in enumerate(regr[-1].estimators_):
+    #     print(f"Tree {i} depth: {tree.tree_.max_depth}")
     # model = AdversarialTrainingClassifier(
     #     estimator=deepmodel,
     #     n_estimators=10,
@@ -264,21 +293,29 @@ def train(X_train, y_train, X_valid, y_valid, nclass, feature_names, human_disea
     #     save_dir=args['rootDir'],
     # )
 
+    all_probs = regr.predict_proba(X_train_gene)
+    print('train auc: ',roc_auc_score(y_train, all_probs[:,1]) )
+    
     importances = regr[-1].feature_importances_
+    # importances = regr[-1].coef_[0]
+    print(importances.shape)
+    print(importances)
+    # return
     feature_importance_pairs = list(zip(feature_names, importances))
 
     # 根据重要性降序排序
     sorted_feature_importances = sorted(feature_importance_pairs, key=lambda x: x[1], reverse=True)
 
     for feature, importance in sorted_feature_importances[:100]:
-        print(f"{feature}: {importance:.4f}")
+        if importance > 0.00000001:
+            print(f"importance {feature}: {importance:.4f}")
 
 
     all_probs = regr.predict_proba(X_valid_gene)
     # all_probs = model(X_valid_gene)
     all_probs = torch.Tensor(all_probs).detach().cpu()
     all_auc = []
-    rows, cols = 2, 3
+    rows, cols = 2, 2
     fig, ax = plt.subplots(rows, cols)
     thres = [0 for _ in range(nclass)]
     for i in range(1, nclass):
@@ -288,10 +325,11 @@ def train(X_train, y_train, X_valid, y_valid, nclass, feature_names, human_disea
         C_y_valid = [(0 if b == 0 else 1) for a, b in prob_y]
         C_y_probs = torch.stack([a for a, b in prob_y])[:, i]
 
-        auc, best_thres = subdraw_roc_by_proba(ax[int(i / cols)][i % cols], C_y_valid, C_y_probs,
-                                   name=human_diseasename_list[i])
+        auc, best_thres = subdraw_roc_by_proba(ax[int(i / cols)][i % cols], C_y_valid, C_y_probs,name=human_diseasename_list[i])
         if not best_thres:
             best_thres = 0.5
+            print('error no best_thres')
+            1/0
         print(human_diseasename_list[i] + ':', auc)
 
         thres[i] = best_thres
@@ -301,31 +339,33 @@ def train(X_train, y_train, X_valid, y_valid, nclass, feature_names, human_disea
         all_auc.append(auc)
         print('######################' + human_diseasename_list[i] + ' end #####################')
     # plt.subplot(2,2,nclass)
+
     pan_y_probs = 1 - all_probs[:, 0]
     pan_y_valid = [(0 if b == 0 else 1) for b in y_valid]
 
-    auc, best_thres = subdraw_roc_by_proba(ax[0][0], pan_y_valid, pan_y_probs, name='pan cancer')
+    # auc, best_thres = subdraw_roc_by_proba(ax[0][0], pan_y_valid, pan_y_probs, name='pan cancer')
     if not best_thres:
         best_thres = 0.5
     thres[0] = best_thres
     pan_y_probs_cali = Calibrate(best_thres, pan_y_probs)
     print('0: ,', [p.item() for p, l in zip(pan_y_probs_cali, pan_y_valid) if l == 0])
     print('1: ,', [p.item() for p, l in zip(pan_y_probs_cali, pan_y_valid) if l == 1])
-    print('pan cancer:', auc)
+    print('pan disease:', auc)
     all_auc.append(auc)
     fig.tight_layout()
     fig.savefig(args['rootDir'] + '/multi_total_roc.png', bbox_inches='tight', dpi=150)
     plt.show()
     for a in all_auc:
-        print(a)
-
+        print('auc:',a)
+    
+    all_probs[:, 0] = 1 - all_probs[:,0]
     for i,b_thres in enumerate(thres):
         all_probs[:,i] = Calibrate(b_thres, all_probs[:,i])
-    all_probs[:, 0] = 1 - all_probs[:,i]
+    all_probs[:, 0] = 1 - all_probs[:,0]
     y_pred = torch.argmax(all_probs, dim=-1)
     cm = confusion_matrix(np.asarray(y_valid), np.asarray(y_pred))
     cm = cm / cm.sum(1)[:, None]
-    print(cm)
+    print('cm:',cm)
     confusion_matrix_plot(cm, human_diseasename_list, filename='real_multi')
 
     print(human_diseasename_list)
@@ -361,12 +401,13 @@ def subdraw_roc_by_proba(ax, y_valid, gbm_y_proba, name='', c='b'):
     ax.set_ylabel('Sensitivity(True Positive)', fontsize=5)  # sensitivity = gbm_tpr
     # ax.xticks(fontsize=5)
     # ax.yticks(fontsize=5)
-    print('x: ', gbm_fpr)
-    print('y: ', gbm_tpr)
+    print('x(gbm_fpr): ', gbm_fpr)
+    print('y(gbm_tpr): ', gbm_tpr)
+    print('gbm_threasholds')
     ax.plot(list(np.array(gbm_fpr)), gbm_tpr, c)
     ax.fill_between(list(np.array(gbm_fpr)), y1=gbm_tpr, color=c, alpha=0.5)
     # plt.gca().invert_xaxis()  # 将X轴反转
-    # fig.savefig(args['rootDir']+name + '_roc.png', bbox_inches='tight', dpi=150)
+    # plt.savefig(args['rootDir']+name + '_roc.png', bbox_inches='tight', dpi=150)
     # plt.show()
     best_threshold = None
     best_j = 0

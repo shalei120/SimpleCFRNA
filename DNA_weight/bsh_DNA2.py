@@ -9,12 +9,12 @@ from concurrent.futures import ProcessPoolExecutor
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, roc_curve
 
-import model_real
-from model_real import train
+from bsh_model_real2 import train
 from sklearn.model_selection import train_test_split
-from Hyperparameters import args
+from bsh_Hyperparameters2 import args
 import argparse
-from RNAdata import receive_any_task,RNAseq_Record
+import json
+# from RNAdata import receive_any_task,RNAseq_Record
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', '-g')
@@ -26,7 +26,7 @@ else:
 chromosome_basepairs = {
     "1": 249_000_000,
     "2": 243_000_000,
-    "3": 198_260_000,
+    "3": 198_300_000,
     "4": 191_000_000,
     "5": 182_000_000,
     "6": 171_000_000,
@@ -37,33 +37,37 @@ chromosome_basepairs = {
     "11": 135_090_000,
     "12": 134_000_000,
     "13": 115_000_000,
-    "14": 107_000_000,
+    "14": 107_050_000,
     "15": 102_000_000,
-    "16": 90_250_000,
+    "16": 90_340_000,
     "17": 84_000_000,
-    "18": 80_290_000,
+    "18": 80_380_000,
     "19": 59_000_000,
-    "20": 64_350_000,
+    "20": 64_450_000,
     "21": 47_000_000,
     "22": 51_000_000,
     "X": 156_050_000,
-    "Y": 57_000_000
+    "Y": 57_230_000
 }
 
-print(args)
+# print(args)
 class ChromosomeDataset(Dataset):
-    def __init__(self, tsv_dir, bin_size=100000):
+    def __init__(self, tsv_dir,output_dir,checkpoint_file, bin_size=100000):
         self.bin_size = bin_size
-        self.pkl_path = args['rootDir'] + 'name_label_data'+str(bin_size)+'.pkl'
+        self.pkl_path = args['rootDir'] + 'name_label_data'+str(bin_size)+'.pkl' # 存储处理后的标签数据
         self.processed_data = []
+        # self.processed_data1= []
         self.ids = []
         self.labels = []
         self.tsv_dir = tsv_dir
         # info_filename = tsv_dir + '/cfDNA_LG_FJ_pheno.xlsx'
-        info_filename = './cfDNA0624.xlsx' # 标签文件
-        print('efef')
+        info_filename =  args['metadata'] # 标签文件
 
-        print('here')
+        self.output_dir = output_dir
+        self.checkpoint_file = checkpoint_file
+        os.makedirs(output_dir, exist_ok=True)
+        self.completed_files = self.load_checkpoint()
+
         if os.path.exists(self.pkl_path):
             with open(self.pkl_path, 'rb') as f:
                 loaded_dict = pickle.load(f)
@@ -74,14 +78,16 @@ class ChromosomeDataset(Dataset):
             print("Data loaded from binary file.")
         else:
             # 读取Excel文件，针对标签元数据中的样本编号做处理，得到样本编号：疾病标签的字典
-            info_df = pd.read_excel(info_filename, sheet_name='Sheet1')
-            info_df['样本编号'] = info_df['样本编号'].apply(self.process_sample_number)
-            if info_df['样本编号'].is_unique:
-                name_label_dict = dict(zip(info_df['样本编号'], info_df['样本类型']))
+            # info_df = pd.read_excel(info_filename, sheet_name='Sheet1')
+            info_df = pd.read_csv(info_filename)
+
+            info_df['Run'] = info_df['Run'].apply(self.process_sample_number)
+            if info_df['Run'].is_unique:
+                name_label_dict = dict(zip(info_df['Run'], info_df['platinumsensitivity']))
             else:
                 print(
                     "Warning: 'name' column contains duplicate values. The dictionary will only keep the last occurrence of each name.")
-                name_label_dict = dict(zip(info_df['样本编号'], info_df['样本类型']))
+                name_label_dict = dict(zip(info_df['Run'], info_df['platinumsensitivity']))
 
 
             datafile_list = os.listdir(tsv_dir)
@@ -89,8 +95,9 @@ class ChromosomeDataset(Dataset):
             for tsv_file in tqdm(datafile_list):
                 if 'xlsx' not in tsv_file:
                     checkkey = tsv_file.split('.')[0]
-                    self.ids.append(checkkey)
-                    self.labels.append(1 if name_label_dict[checkkey]=='疾病' else 0)
+                    if checkkey in name_label_dict.keys():
+                        self.ids.append(checkkey)
+                        self.labels.append(1 if name_label_dict[checkkey] == 'Resistant' else 0)
 
             # 处理每个样本文件，得到self.processed_data的列表，列表中每个元素是该样本对应的向量
             self.ordered_parallel_process_files(datafile_list)
@@ -108,6 +115,23 @@ class ChromosomeDataset(Dataset):
         # generank = generank - total_gene_num + 200
         # generank[generank < 0] = 0
         self.processed_data = torch.tensor(self.processed_data, dtype=torch.float32)
+
+    def load_checkpoint(self):
+        if os.path.exists(self.checkpoint_file):
+            with open(self.checkpoint_file, 'r') as f:
+                return set(json.load(f))
+        return set()
+    def save_checkpoint(self):
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(list(self.completed_files), f)
+
+    def save_result(self, result, tsv_file):
+        output_file = os.path.join(self.output_dir, f"{os.path.basename(tsv_file)}.npy")
+        np.save(output_file, result)
+        # with open(output_file, 'w') as f:
+        #     f.write(result)
+
+
     @staticmethod
     def process_sample_number(sample_number):
         # 使用正则表达式替换 '+数字-' 为空字符串
@@ -131,26 +155,50 @@ class ChromosomeDataset(Dataset):
             # 读取样本tsv，赋予前三列列名
             data = pd.read_csv(os.path.join(self.tsv_dir, tsv_file),
                                sep='\t', header=None,
-                               names=['chromosome', 'position', 'ignored'])
-            return self.process_data(data)
+                               names=['chromosome', 'position1','position2','weight'])
+            try:
+                out =   self.process_data(data,tsv_file)
+            except Exception as e:
+                print(f"Error occurred: {e}")          
+            return out
         return None
+
+    def load_result(self, tsv_file):
+        output_file = os.path.join(self.output_dir, f"{os.path.basename(tsv_file)}.processed")
+        with open(output_file, 'r') as f:
+            return f.read()
+    def merge_results(self):
+
+        for file in os.listdir(self.output_dir):
+            if file.endswith(".npy"):  # 确保只合并处理后的文件
+                self.processed_data.append(np.load(os.path.join(self.output_dir, file)))
+                # with open(os.path.join(self.output_dir, file), 'r') as f:
+                #     self.processed_data.append(f.read())
+        print(f"Results merged")
 
     def ordered_parallel_process_files(self, datafile_list):
         # 确定使用的CPU核心数
-        num_workers = min(32, os.cpu_count() or 1)  # 限制最大使用32个核心
+        num_workers = min(10, os.cpu_count()-3 or 1)  # 限制最大使用32个核心
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             # 创建一个任务列表，但不立即开始执行
-            futures = [executor.submit(self.process_file, tsv_file)
-                       for tsv_file in datafile_list if 'xlsx' not in tsv_file]
+            futures = [
+                executor.submit(self.process_file, tsv_file)
+                for tsv_file in datafile_list if 'xlsx' not in tsv_file and tsv_file not in self.completed_files
+                ]
 
             # 按照原始顺序处理结果
-            for future in tqdm(futures, total=len(futures), desc="Processing files"):
+            # for future in tqdm(futures, total=len(futures), desc="Processing files"):
+            for tsv_file, future in zip(datafile_list, tqdm(futures, total=len(futures), desc="Processing files")):
                 result = future.result()  # 这会阻塞直到任务完成
                 if result is not None:
+                    self.save_result(result, tsv_file)
+                    self.completed_files.add(tsv_file)  # 添加到完成列表
+                    self.save_checkpoint() 
                     self.processed_data.append(result)
+            self.merge_results()
 
-    def process_data(self, data):
+    def process_data(self, data,file_name):
         chromosome_vectors = []
         # print(data['chromosome'].unique())
         chrom2bin = {} # 染色体：该染色体分块数量长度的向量，向量中每一个元素表示该片段上有几个变异位点
@@ -161,16 +209,28 @@ class ChromosomeDataset(Dataset):
             bins = np.zeros(num_bins, dtype=int)
             chrom2bin[key] = bins
         print(chrom2bin.keys())
-
         for _, row in data.iterrows():
-            bin_index = row['position'] // self.bin_size # 判断该位置为哪一块染色体片段上
-            try:
-                chrom2bin[row['chromosome'][3:]][bin_index] += 1
-            except:
-                print(row['chromosome'][3:], bin_index, row['position'])
-                chrom2bin[row['chromosome'][3:]][bin_index] += 1
+            # print("test begin")
+            bin_index1 = row['position1'] // self.bin_size # 判断该位置为哪一块染色体片段上
+            bin_index2 = row['position2'] // self.bin_size # 判断该位置为哪一块染色体片段上
+            chromosome = row['chromosome'][3:]
+            # try:
+            # print(row['chromosome'][3:], bin_index1,bin_index2, row['position'])
+            if chromosome in chrom2bin.keys():
+                error = bin_index2 + 1
+                if bin_index2 + 1>len(chrom2bin[chromosome]):
+                    error = len(chrom2bin[chromosome])
+                    print('bin_index2 error:',bin_index2,error,file_name,row['chromosome'],row['position1'],row['position2'],row['weight'])
+                for bin_now in range(bin_index1,error ):
+                    begin = max(bin_now*self.bin_size,row['position1'])
+                    end = min((bin_now+1)*self.bin_size,row['position2'])
+                    chrom2bin[chromosome][bin_now] += (end-begin)*row['weight']
 
+            # except:
+            #     print(row['chromosome'][3:], bin_index, row['position'])
+            #     chrom2bin[row['chromosome'][3:]][bin_index] += 1
 
+        print('ok')
         for key,value in chromosome_basepairs.items():# chrom2bin中的向量部分组成列表
             chromosome_vectors.append(chrom2bin[key])
 
@@ -260,9 +320,8 @@ def drawEvery(testY, all_probs):
     print('AUC=', auc)
 
 
-def test(DNA_dict, RNA_dict, model, ID_train):
+def test(DNA_dict, model, ID_train):
     DNA_info_filename = './cfDNA_孕早期.xlsx'
-    RNA_info_filename = './cfRNA_孕早期.xlsx'
     ID_train_set = set(ID_train)
 
     info_df = pd.read_excel(DNA_info_filename, sheet_name='Sheet1')
@@ -324,32 +383,14 @@ def test(DNA_dict, RNA_dict, model, ID_train):
 
 
 if __name__ == "__main__":
-    tsv_dir = '/home/siweideng/OxTium_cfDNA' # dna文件都是tsv，标签文件是csv
+    tsv_dir = '/mnt/data3/DNA/output' # dna文件都是tsv，标签文件是csv
     # dataloader = create_dataloader(tsv_dir)
     DNA_names = GetDNANames(bin_size=1000) # 根据染色体长度，得到分块后每块的起始位置和结束位置
-    dataset = ChromosomeDataset(tsv_dir,bin_size=1000) # 处理整合样本数据
-    receive_any_task(rpkm_filename = '../Huada00.data/LG_02.All_sample_reads_count.csv',
-                     info_filename = '../Huada00.data/LG_03.All_sample_type.txt',
-                     rpkmt_filename = '../Huada00.data/alldataLG.csv',
-                     DictInfoColumnRename = {'Type': 'disease', 'Sample': 'Run'},
-                     HealthyLabel ='CTRL', GeneColumn= 'gene_id',
-                     T = RNAseq_Record.tranpose)
-    receive_any_task(rpkm_filename = '../Huada00.data/FJ_02.All_sample_reads_count.csv',
-                     info_filename = '../Huada00.data/FJ_03.All_sample_type.txt',
-                     rpkmt_filename = '../Huada00.data/alldataFJ.csv',
-                     DictInfoColumnRename = {'Type': 'disease', 'Sample': 'Run'},
-                     HealthyLabel ='CTRL', GeneColumn= 'gene_id',
-                     T = RNAseq_Record.tranpose)
-    rpkmt_filename = '../Huada00.data/alldataLG.csv'
-    RPKMt1 = pd.read_csv(rpkmt_filename, delimiter=',')
-    RPKMt1['Run'] = RPKMt1['Run'].apply(process_RNA_sample_number) # 处理并重新编辑样本名
+    dataset = ChromosomeDataset(tsv_dir,'./output_data','checkpoint.json',bin_size=1000) # 处理整合样本数据
 
-    rpkmt_filename2 = '../Huada00.data/alldataLG.csv'
-    RPKMt2 = pd.read_csv(rpkmt_filename2, delimiter=',')
-    RPKMt2['Run'] = RPKMt2['Run'].apply(process_RNA_sample_number)
-    RPKMt = pd.concat([RPKMt1, RPKMt2], axis=0) # 拼接两个csv
     print(tsv_dir)
-    print('RPKMt',RPKMt['Run'])
+    # print('RPKMt',RPKMt['Run'])
+    
     ID = dataset.ids
     X = dataset.processed_data
     y = dataset.labels
@@ -357,15 +398,15 @@ if __name__ == "__main__":
     DNA_id2ind = {id:ind for ind, id in enumerate(ID)}
 
     # 存储未找到匹配的样本
-    not_found = []
+    # not_found = []
     matched = []
-    search_list = set(ID)
+    # search_list = set(ID)
     # 遍历DataFrame的sample列
-    for ind, sample in enumerate(RPKMt['Run']):
-        # print(ind,sample)
-        if sample in search_list:
-            matched.append(sample)
-    matched = list(set(matched))
+    # for ind, sample in enumerate(RPKMt['Run']):
+    #     # print(ind,sample)
+    #     if sample in search_list:
+    #         matched.append(sample)
+    matched = list(ID)
     X_dna = [] # 按照两个新读取的csv匹配数据集
     y_dna = []
     for matchedID in matched:
@@ -376,28 +417,31 @@ if __name__ == "__main__":
     X_dna = torch.stack(X_dna)
     y_dna = torch.Tensor(y_dna)
     print(X_dna.size(),y_dna.size(),len(matched))
-    # 只保留RPKMt中matched的行
-    RPKMt_reordered = RPKMt.set_index('Run').loc[matched].reset_index()
+    # # 只保留RPKMt中matched的行
+    # RPKMt_reordered = RPKMt.set_index('Run').loc[matched].reset_index()
     # 删除重复的行
-    RPKMt_reordered = RPKMt_reordered.drop_duplicates(subset='Run', keep='first')
+    # RPKMt_reordered = RPKMt_reordered.drop_duplicates(subset='Run', keep='first')
     # for i,id in enumerate(RPKMt_reordered['Run']):
     #     print('ji:',i, id)
     #
     # for i,m in enumerate(matched):
     #     print('m:',i,m)
-    RNA_id2ind = {id:ind for ind, id in enumerate(RPKMt_reordered['Run'])}
-    y_rna = list(RPKMt_reordered['disease'])
-    RPKMt_reordered = RPKMt_reordered.drop(['Run','region','disease'], axis=1)
-    print(RPKMt_reordered.columns)
-    RNA_names = list(RPKMt_reordered.columns)
-    X_rna = torch.Tensor(RPKMt_reordered.values)
-    print(X_rna.size())
-    Xdata = torch.cat([X_dna,X_rna],dim=1)
+    # RNA_id2ind = {id:ind for ind, id in enumerate(RPKMt_reordered['Run'])}
+    # y_rna = list(RPKMt_reordered['disease'])
+    # RPKMt_reordered = RPKMt_reordered.drop(['Run','region','disease'], axis=1)
+    # print(RPKMt_reordered.columns)
+    # RNA_names = list(RPKMt_reordered.columns)
+    # X_rna = torch.Tensor(RPKMt_reordered.values)
+    # print(X_rna.size())
+    Xdata = X_dna
     # Xdata = X_rna
-    print(len(DNA_names),X_dna.size(1),len(RNA_names) , X_rna.size(1))
+    # print(len(DNA_names),X_dna.size(1))
     assert len(DNA_names) == X_dna.size(1)
-    assert len(RNA_names) == X_rna.size(1)
-    ID_train, ID_test, X_train, X_test, y_train, y_test = train_test_split(matched, Xdata, y_dna, test_size=0.4, random_state=42)
-    model = train(X_train, y_train, X_test, y_test, 2, DNA_names,RNA_names, human_diseasename_list=['healthy', 'disease'])
+    # print(DNA_names)
+    ID_train, ID_test, X_train, X_test, y_train, y_test = train_test_split(matched, Xdata, y_dna, 
+                                                                           test_size=0.4, random_state=42)
+    # print(ID_train)
+    model = train(X_train, y_train, X_test, y_test, 2, DNA_names,
+                human_diseasename_list=['healthy', 'disease'])
 
-    test({"DNA_id2ind":DNA_id2ind, 'X':X, 'Y':y}, {'RNA_id2ind':RNA_id2ind, 'X':X_rna, 'Y':y_rna}, model, ID_train)
+    # test({"DNA_id2ind":DNA_id2ind, 'X':X, 'Y':y}, model, ID_train)
